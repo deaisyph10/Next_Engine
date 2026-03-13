@@ -1,0 +1,304 @@
+#include "ScriptEngine.h"
+#include "mono/jit/jit.h" 
+#include <mono/metadata/appdomain.h>
+#include "mono/metadata/assembly.h"
+#include <mono/metadata/blob.h>
+#include <mono/metadata/class.h>
+#include <mono/metadata/image.h>
+#include <mono/metadata/metadata.h>
+#include <mono/metadata/object.h>
+#include <mono/metadata/object-forward.h>
+#include <mono/utils/mono-forward.h>
+#include <core.h>
+#include <cstdint>
+#include <fstream>
+#include <log.h>
+#include <string>
+#include "ScriptAdaptors.h"
+#include <scene/Scene.h>
+#include <core/UUID.h>
+#include <unordered_map>
+#include <scene/Entity.h>
+#include <scene/Component.h>
+#include <string.h>
+#include <spdlog/fmt/bundled/format.h>
+
+namespace Utils
+{
+	static char* ReadBytes(const std::string& filepath, uint32_t* outSize)
+	{
+		std::ifstream stream(filepath, std::ios::binary | std::ios::ate);
+		if (!stream)
+		{
+			EX_CORE_ERROR("Failed to open file: {}", filepath);
+			return nullptr;
+		}
+		std::streampos end = stream.tellg();
+		stream.seekg(0, std::ios::beg);
+		uint32_t size = end - stream.tellg();
+		if (size == 0)
+		{
+			EX_CORE_ERROR("File is empty: {}", filepath);
+			return nullptr;
+		}
+		char* buffer = new char[size];
+		stream.read((char*)buffer, size);
+		stream.close();
+		*outSize = size;
+		return buffer;
+	}
+}
+
+namespace Exodus
+{
+
+	struct ScriptEngineData
+	{
+		MonoDomain* RootDomain = nullptr;
+		MonoDomain* AppDomain = nullptr;
+
+		MonoAssembly* CoreAssembly = nullptr;
+		MonoImage* CoreAssemblyImage = nullptr;
+
+		ScriptClass EntityClass;
+
+		std::unordered_map<std::string, Ref<ScriptClass>> EntityClasses;
+		std::unordered_map<UUID, Ref<ScriptInstance>> EntityInstances;
+
+		// Runtime
+		Scene* SceneContext = nullptr;
+	};
+
+	static ScriptEngineData* s_Data = nullptr;
+
+	void ScriptEngine::Init()
+	{
+		s_Data = new ScriptEngineData();
+		InitMono();
+		LoadAssembly("Resources/Scripts/Debug/net10.0/EX_ScriptCore.dll");
+		Adaptor::RegisterFunctions();
+
+		// TESTING: Create an instance of the Main class and call the PrintMessage method
+
+		MonoImage* coreAssemblyImage = mono_assembly_get_image(s_Data->CoreAssembly);
+		MonoClass* monoClass = mono_class_from_name(coreAssemblyImage, "EX_ScriptCore", "Main");
+		MonoObject* instance = mono_object_new(s_Data->AppDomain, monoClass);
+		mono_runtime_object_init(instance);
+		MonoString* message = mono_string_new(s_Data->AppDomain, "Hello from C++!");
+		void* params[1];
+		params[0] = message;
+	}
+
+	void ScriptEngine::Shutdown()
+	{
+		ShutdownMono();
+		delete s_Data;
+	}
+
+	void ScriptEngine::OnRuntimeStart(Scene* scene)
+	{
+		s_Data->SceneContext = scene;
+	}
+
+	bool ScriptEngine::EntityClassExists(const std::string& fullClassName)
+	{
+		return s_Data->EntityClasses.find(fullClassName) != s_Data->EntityClasses.end();
+	}
+
+	void ScriptEngine::OnCreateEntity(Entity entity)
+	{
+		const auto& sc = entity.GetComponent<ScriptComponent>();
+		if (ScriptEngine::EntityClassExists(sc.ClassName))
+		{
+			Ref<ScriptInstance> instance = CreateRef<ScriptInstance>(s_Data->EntityClasses[sc.ClassName], entity);
+			s_Data->EntityInstances[entity.GetUUID()] = instance;
+			instance->InvokeOnCreate();
+		}
+	}
+
+	void ScriptEngine::OnUpdateEntity(Entity entity, Timestep ts)
+	{
+		UUID entityUUID = entity.GetUUID();
+		EX_CORE_ASSERT(s_Data->EntityInstances.find(entityUUID) != s_Data->EntityInstances.end());
+
+		Ref<ScriptInstance> instance = s_Data->EntityInstances[entityUUID];
+		instance->InvokeOnUpdate((float)ts);
+	}
+
+	Scene* ScriptEngine::GetSceneContext()
+	{
+		return s_Data->SceneContext;
+	}
+
+	void ScriptEngine::OnRuntimeStop()
+	{
+		s_Data->SceneContext = nullptr;
+		s_Data->EntityInstances.clear();
+	}
+
+	std::unordered_map<std::string, Ref<ScriptClass>> ScriptEngine::GetEntityClasses()
+	{
+		return s_Data->EntityClasses;
+	}
+
+	MonoAssembly* LoadCSharpAssembly(const std::string& assemblyPath)
+	{
+		uint32_t fileSize = 0;
+		char* fileData = Utils::ReadBytes(assemblyPath, &fileSize);
+		MonoImageOpenStatus status;
+		MonoImage* image = mono_image_open_from_data_full(fileData, fileSize, 1, &status, 0);
+		if (status != MONO_IMAGE_OK)
+		{
+			const char* errorMessage = mono_image_strerror(status);
+			EX_CORE_ERROR("Failed to load assembly from path: {}. Error: {}", assemblyPath, errorMessage);
+			return nullptr;
+		}
+		std::string pathString = assemblyPath;
+		MonoAssembly* assembly = mono_assembly_load_from_full(image, pathString.c_str(), &status, 0);
+		mono_image_close(image);
+		delete[] fileData;
+		return assembly;
+	}
+
+	static void PrintAssemblyTypes(MonoAssembly* assembly)
+	{
+		MonoImage* image = mono_assembly_get_image(assembly);
+		const MonoTableInfo* typeDefinitionsTable = mono_image_get_table_info(image, MONO_TABLE_TYPEDEF);
+		int32_t numTypes = mono_table_info_get_rows(typeDefinitionsTable);
+	   		for (int32_t i = 0; i < numTypes; i++)
+		{
+			uint32_t cols[MONO_TYPEDEF_SIZE];
+			mono_metadata_decode_row(typeDefinitionsTable, i, cols, MONO_TYPEDEF_SIZE);
+	   		const char* nameSpace = mono_metadata_string_heap(image, cols[MONO_TYPEDEF_NAMESPACE]);
+			const char* name = mono_metadata_string_heap(image, cols[MONO_TYPEDEF_NAME]);
+	  			EX_CORE_WARN("{}.{}", nameSpace, name);
+		}
+	}
+
+	void ScriptEngine::LoadAssembly(const std::string& assemblyPath)
+	{
+		// Create the application domain
+		s_Data->AppDomain = mono_domain_create_appdomain((char*)"NexTScriptRuntime", nullptr);
+		if (!s_Data->AppDomain)
+		{	EX_CORE_ASSERT("Failed to create Mono application domain."); return;	}
+		mono_domain_set(s_Data->AppDomain, true);
+		s_Data->CoreAssembly = LoadCSharpAssembly(assemblyPath);
+		PrintAssemblyTypes(s_Data->CoreAssembly);
+	}
+
+	void ScriptEngine::InitMono()
+	{
+		mono_set_assemblies_path("mono/lib/4.5");
+		MonoDomain* rootDomain = mono_jit_init("NexTJITRuntime");
+		if (rootDomain == nullptr)
+		{	EX_CORE_ASSERT("Failed to initialize Mono JIT."); return;  	}
+		s_Data->RootDomain = rootDomain;
+	}
+
+	void ScriptEngine::ShutdownMono()
+	{
+		// mono_domain_unload(s_Data->AppDomain);
+		s_Data->AppDomain = nullptr;
+		// mono_jit_cleanup(s_Data->RootDomain);
+		s_Data->RootDomain = nullptr;
+	}
+
+	void ScriptEngine::LoadAssemblyClasses(MonoAssembly* assembly)
+	{
+		s_Data->EntityClasses.clear();
+
+		MonoImage* image = mono_assembly_get_image(assembly);
+		const MonoTableInfo* typeDefinitionsTable = mono_image_get_table_info(image, MONO_TABLE_TYPEDEF);
+		int32_t numTypes = mono_table_info_get_rows(typeDefinitionsTable);
+		MonoClass* entityClass = mono_class_from_name(image, "EX_ScriptCore", "Main");
+
+		for (int32_t i = 0; i < numTypes; i++)
+		{
+			uint32_t cols[MONO_TYPEDEF_SIZE];
+			mono_metadata_decode_row(typeDefinitionsTable, i, cols, MONO_TYPEDEF_SIZE);
+
+			const char* nameSpace = mono_metadata_string_heap(image, cols[MONO_TYPEDEF_NAMESPACE]);
+			const char* name = mono_metadata_string_heap(image, cols[MONO_TYPEDEF_NAME]);
+			std::string fullName;
+			if (strlen(nameSpace) != 0)
+				fullName = fmt::format("{}.{}", nameSpace, name);
+			else
+				fullName = name;
+
+			MonoClass* monoClass = mono_class_from_name(image, nameSpace, name);
+
+			if (monoClass == entityClass)
+				continue;
+
+			bool isEntity = mono_class_is_subclass_of(monoClass, entityClass, false);
+			if (isEntity)
+				s_Data->EntityClasses[fullName] = CreateRef<ScriptClass>(nameSpace, name);
+		}
+	}
+
+	MonoImage* ScriptEngine::GetCoreAssemblyImage()
+	{
+		return s_Data->CoreAssemblyImage;
+	}
+
+	MonoObject* ScriptEngine::InstantiateClass(MonoClass* monoClass)
+	{
+		MonoObject* instance = mono_object_new(s_Data->AppDomain, monoClass);
+		mono_runtime_object_init(instance);
+		return instance;
+	}
+
+	ScriptClass::ScriptClass(const std::string& classNamespace, const std::string& className)
+		: m_ClassNamespace(classNamespace), m_ClassName(className)
+	{
+		m_MonoClass = mono_class_from_name(s_Data->CoreAssemblyImage, classNamespace.c_str(), className.c_str());
+	}
+
+	MonoObject* ScriptClass::Instantiate()
+	{
+		return ScriptEngine::InstantiateClass(m_MonoClass);
+	}
+
+	MonoMethod* ScriptClass::GetMethod(const std::string& name, int parameterCount)
+	{
+		return mono_class_get_method_from_name(m_MonoClass, name.c_str(), parameterCount);
+	}
+
+	MonoObject* ScriptClass::InvokeMethod(MonoObject* instance, MonoMethod* method, void** params)
+	{
+		return mono_runtime_invoke(method, instance, params, nullptr);
+	}
+
+	ScriptInstance::ScriptInstance(Ref<ScriptClass> scriptClass, Entity entity)
+		: m_ScriptClass(scriptClass)
+	{
+		m_Instance = scriptClass->Instantiate();
+
+		m_Constructor = s_Data->EntityClass.GetMethod("Constructor", 1);
+		m_OnCreateMethod = scriptClass->GetMethod("OnCreate", 0);
+		m_OnUpdateMethod = scriptClass->GetMethod("OnUpdate", 1);
+
+		// Call Entity constructor
+		{
+			UUID entityID = entity.GetUUID();
+			void* param = &entityID;
+			m_ScriptClass->InvokeMethod(m_Instance, m_Constructor, &param);
+		}
+	}
+
+	void ScriptInstance::InvokeOnCreate()
+	{
+		if (m_OnCreateMethod)
+			m_ScriptClass->InvokeMethod(m_Instance, m_OnCreateMethod);
+	}
+
+	void ScriptInstance::InvokeOnUpdate(float ts)
+	{
+		if (m_OnUpdateMethod)
+		{
+			void* param = &ts;
+			m_ScriptClass->InvokeMethod(m_Instance, m_OnUpdateMethod, &param);
+		}
+	}
+
+}
