@@ -1,0 +1,18 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Box2D/Box2D.vcxproj" Id="b863a08b-5f7c-4ecf-98e8-25dd82e12c4b" />
+  <Project Path="EX_ScriptCore/EX_ScriptCore.csproj" Id="8134f26e-914b-4634-aa88-0ced5f0fc449" />
+  <Project Path="GLFW_/GLFW_.vcxproj" Id="cffab55e-1a54-402e-9e95-346b701d67a5" />
+  <Project Path="NexTApp/NexTApp.vcxproj" Id="c342dac6-47da-4cf9-be56-1778418fcb90">
+    <BuildDependency Project="GLFW_/GLFW_.vcxproj" />
+    <BuildDependency Project="NexT_Engine/vendor/glad/glad/glad.vcxproj" />
+  </Project>
+  <Project Path="NexT_Engine/NexT_Engine.vcxproj" Id="4f609ebc-85a0-4aaf-89ff-612d483eabc6" />
+  <Project Path="NexT_Engine/vendor/glad/glad/glad.vcxproj" Id="72b51e85-22d5-41e5-bfba-444867cd4129" />
+  <Project Path="NexT_Engine/vendor/ImGUI/ImGUI.vcxproj" Id="a3316aaa-bb68-45a7-971c-0650e87882d3" />
+  <Project Path="NexT_Engine/vendor/Yaml-cpp/Yaml-cpp.vcxproj" Id="1603db94-5676-4ed7-843e-c6e42164b671" />
+</Solution>
